@@ -604,15 +604,15 @@ textarea { resize: vertical; min-height: 80px; width: 100%; font-family: 'Consol
     </div>
 
     <!-- Output -->
-    <div class="panel" style="flex:1;min-height:200px;display:flex;flex-direction:column">
+    <div class="panel" style="flex:1;min-height:200px;display:flex;flex-direction:column;min-width:0;overflow:hidden">
       <div class="input-row" style="margin-bottom:8px;gap:8px">
         <button class="btn btn-secondary" id="mafftBtnVisual" onclick="mafftSwitchTab('visual')">Visual</button>
         <button class="btn btn-secondary" id="mafftBtnText" onclick="mafftSwitchTab('text')">Text</button>
         <label style="font-size:12px;font-weight:600;margin-left:12px">Color Scheme:</label>
         <select id="mafftColorScheme" onchange="mafftRecolor()"><option>ClustalX</option><option>Hydrophobicity</option><option>Taylor</option></select>
       </div>
-      <div id="mafftVisualWrap" style="flex:1;overflow:auto;display:block">
-        <pre id="mafftVisual" style="font-family:Consolas,monospace;font-size:12px;line-height:1.5;padding:8px;background:#111;border-radius:6px;min-height:100px;white-space:pre;overflow-x:auto">Alignment results will appear here...</pre>
+      <div id="mafftVisualWrap" style="flex:1;overflow:auto;display:block;min-width:0">
+        <pre id="mafftVisual" style="font-family:Consolas,monospace;font-size:12px;line-height:1.5;padding:8px;background:#111;border-radius:6px;min-height:100px;white-space:pre;width:max-content;min-width:100%">Alignment results will appear here...</pre>
       </div>
       <div id="mafftOutputTextWrap" style="flex:1;overflow:auto;display:none">
         <pre id="mafftOutputText" style="font-family:Consolas,monospace;font-size:12px;line-height:1.4;padding:8px;background:#111;border-radius:6px;min-height:100px;white-space:pre;overflow-x:auto"></pre>
@@ -2111,18 +2111,32 @@ function mafftLoadFile() {
 
 
 // ═══════════════════════════════════════════════════════════════
-//  BLAST — Sequence Similarity Search (NCBI REST API)
+//  BLAST — Sequence Similarity Search (EBI NCBI BLAST+ API)
 // ═══════════════════════════════════════════════════════════════
 
-const NCBI_BLAST_URL = 'https://blast.ncbi.nlm.nih.gov/blast/Blast.cgi';
-// CORS proxy to work around NCBI's lack of CORS headers
-const CORS_PROXY = 'https://corsproxy.io/?';
+const EBI_BLAST_BASE = 'https://www.ebi.ac.uk/Tools/services/rest/ncbiblast';
 
 function blastSetStatus(msg, type) {
     const el = document.getElementById('blastStatus');
     if (!el) return;
     el.textContent = msg;
     el.className = 'status-bar' + (type ? ' status-' + type : '');
+}
+
+// ─── Map UI values to EBI API parameters ─────────────────────
+function blastGetEbiProgram(uiProgram) {
+    // EBI uses same program names
+    return uiProgram; // blastp, blastn, blastx
+}
+function blastGetEbiDb(uiDb, uiProgram) {
+    // EBI database names differ from NCBI
+    if (uiDb === 'nr') return uiProgram === 'blastn' ? 'em_rel_std' : 'uniprotkb';
+    if (uiDb === 'swissprot') return 'uniprotkb_swissprot';
+    if (uiDb === 'pdb') return 'pdb';
+    return 'uniprotkb';
+}
+function blastGetStype(uiProgram) {
+    return uiProgram === 'blastn' ? 'dna' : 'protein';
 }
 
 // ─── Submit BLAST Search ─────────────────────────────────────
@@ -2134,179 +2148,139 @@ async function blastRun() {
     const database = document.getElementById('blastDb').value;
     const evalue = document.getElementById('blastEvalue').value || '0.01';
 
-    blastSetStatus('Submitting to NCBI BLAST...', 'info');
-    document.getElementById('blastResults').innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:40px">Searching...</div>';
+    blastSetStatus('Submitting to EBI BLAST...', 'info');
+    document.getElementById('blastResults').innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:40px">Submitting search...</div>';
 
-    const params = new URLSearchParams({
-        CMD: 'Put',
-        QUERY: seq,
-        DATABASE: database,
-        PROGRAM: program,
-        EXPECT: evalue,
-        FORMAT_TYPE: 'JSON2_S',
-        HITLIST_SIZE: '50',
-    });
+    const formData = new FormData();
+    formData.append('email', 'protein-studio-web@example.com');
+    formData.append('program', blastGetEbiProgram(program));
+    formData.append('database', blastGetEbiDb(database, program));
+    formData.append('stype', blastGetStype(program));
+    formData.append('sequence', seq);
+    formData.append('exp', evalue);
+    formData.append('alignments', '50');
+    formData.append('scores', '50');
 
     try {
-        const submitRes = await fetch(CORS_PROXY + encodeURIComponent(NCBI_BLAST_URL), {
+        const submitRes = await fetch(`${EBI_BLAST_BASE}/run`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: params.toString()
+            body: formData
         });
-        const text = await submitRes.text();
-
-        // Parse RID from response
-        const ridMatch = text.match(/RID = (\S+)/);
-        const rtoeMatch = text.match(/RTOE = (\d+)/);
-        if (!ridMatch) {
-            // CORS proxy might have failed — offer fallback
-            blastSetStatus('Could not submit via proxy. Try the direct NCBI link below.', 'error');
-            blastShowFallback(seq, program, database);
+        if (!submitRes.ok) {
+            const errText = await submitRes.text();
+            blastSetStatus(`Submit error: ${errText.substring(0, 120)}`, 'error');
             return;
         }
-        const rid = ridMatch[1];
-        const rtoe = rtoeMatch ? parseInt(rtoeMatch[1]) : 30;
-        blastSetStatus(`Job submitted (RID: ${rid}). Estimated wait: ${rtoe}s...`, 'info');
-        blastPoll(rid, rtoe);
+        const jobId = (await submitRes.text()).trim();
+        blastSetStatus(`Job submitted (${jobId}). Polling for results...`, 'info');
+        document.getElementById('blastResults').innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:40px">Searching... this may take 1-5 minutes.</div>';
+        blastPoll(jobId);
     } catch (e) {
-        blastSetStatus('CORS proxy unavailable. Use the direct NCBI link below.', 'error');
-        blastShowFallback(seq, document.getElementById('blastProgram').value, document.getElementById('blastDb').value);
+        blastSetStatus(`Network error: ${e.message}`, 'error');
     }
 }
 
-function blastShowFallback(seq, program, database) {
-    const url = `https://blast.ncbi.nlm.nih.gov/Blast.cgi?PAGE_TYPE=BlastSearch&PROGRAM=${program}&DATABASE=${database}&QUERY=${encodeURIComponent(seq)}`;
-    document.getElementById('blastResults').innerHTML = `
-        <div style="padding:20px;text-align:center">
-            <p style="color:var(--text-muted);margin-bottom:12px">Direct API access was blocked (CORS). Click below to run BLAST on NCBI:</p>
-            <a href="${url}" target="_blank" rel="noopener" class="btn btn-primary" style="text-decoration:none;display:inline-block">
-                Open NCBI BLAST ↗
-            </a>
-        </div>`;
-}
-
-async function blastPoll(rid, initialWait) {
-    // Wait initial estimate
-    await new Promise(r => setTimeout(r, Math.max(initialWait * 1000, 10000)));
-
-    const maxAttempts = 40; // ~10 min at 15s interval
+async function blastPoll(jobId) {
+    const maxAttempts = 60; // ~5 min at 5s intervals
     for (let i = 0; i < maxAttempts; i++) {
+        await new Promise(r => setTimeout(r, 5000));
         try {
-            const checkUrl = `${NCBI_BLAST_URL}?CMD=Get&RID=${rid}&FORMAT_OBJECT=SearchInfo`;
-            const statusRes = await fetch(CORS_PROXY + encodeURIComponent(checkUrl));
-            const statusText = await statusRes.text();
+            const statusRes = await fetch(`${EBI_BLAST_BASE}/status/${jobId}`);
+            const status = (await statusRes.text()).trim();
 
-            if (statusText.includes('Status=READY')) {
-                if (statusText.includes('ThereAreHits=yes')) {
-                    blastSetStatus('Results ready! Fetching...', 'info');
-                    blastFetchResults(rid);
-                } else {
-                    blastSetStatus('Search complete — no significant hits found.', 'warning');
-                    document.getElementById('blastResults').innerHTML =
-                        '<div style="color:var(--text-muted);text-align:center;padding:40px">No significant similarity found.</div>';
-                }
+            if (status === 'FINISHED') {
+                blastSetStatus('Results ready! Fetching...', 'info');
+                blastFetchResults(jobId);
                 return;
-            } else if (statusText.includes('Status=FAILED')) {
-                blastSetStatus('BLAST search failed.', 'error');
+            } else if (status === 'FAILURE' || status === 'ERROR' || status === 'NOT_FOUND') {
+                blastSetStatus(`Job ${status}. Please try again.`, 'error');
                 return;
             }
-            blastSetStatus(`Searching... (poll ${i + 1}/${maxAttempts})`, 'info');
+            blastSetStatus(`Searching... status: ${status} (${i + 1}/${maxAttempts})`, 'info');
         } catch (e) {
             blastSetStatus(`Poll error: ${e.message}. Retrying...`, 'warning');
         }
-        await new Promise(r => setTimeout(r, 15000));
     }
     blastSetStatus('Timeout — search took too long.', 'error');
 }
 
-async function blastFetchResults(rid) {
+async function blastFetchResults(jobId) {
     try {
-        const url = `${NCBI_BLAST_URL}?CMD=Get&RID=${rid}&FORMAT_TYPE=JSON2_S`;
-        const res = await fetch(CORS_PROXY + encodeURIComponent(url));
-        const text = await res.text();
-
-        // Try to parse JSON
-        try {
-            const data = JSON.parse(text);
-            blastRenderJSON(data);
-        } catch {
-            // Fallback: try XML format
-            const xmlUrl = `${NCBI_BLAST_URL}?CMD=Get&RID=${rid}&FORMAT_TYPE=XML`;
-            const xmlRes = await fetch(CORS_PROXY + encodeURIComponent(xmlUrl));
-            const xmlText = await xmlRes.text();
-            blastRenderXML(xmlText);
-        }
+        // Fetch XML results (EBI returns XML by default for ncbiblast)
+        const res = await fetch(`${EBI_BLAST_BASE}/result/${jobId}/xml`);
+        const xmlText = await res.text();
+        blastParseXML(xmlText);
     } catch (e) {
         blastSetStatus(`Error fetching results: ${e.message}`, 'error');
     }
 }
 
-function blastRenderJSON(data) {
+function blastParseXML(xmlText) {
     const container = document.getElementById('blastResults');
-    try {
-        const search = data.BlastOutput2[0].report.results.search;
-        const hits = search.hits || [];
-        if (!hits.length) {
-            container.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:40px">No hits found.</div>';
-            blastSetStatus('No significant hits.', 'warning');
-            return;
-        }
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(xmlText, 'text/xml');
 
-        let html = `<table class="blast-table">
-            <thead><tr>
-                <th>#</th><th>Accession</th><th>Description</th>
-                <th>Score</th><th>E-value</th><th>Identity</th><th>Length</th>
-            </tr></thead><tbody>`;
-
-        hits.forEach((hit, idx) => {
-            const desc = hit.description[0];
-            const hsp = hit.hsps[0];
-            const identity = ((hsp.identity / hsp.align_len) * 100).toFixed(1);
-            html += `<tr class="blast-row" onclick="blastShowAlignment(${idx})">
-                <td>${idx + 1}</td>
-                <td><a href="https://www.ncbi.nlm.nih.gov/protein/${desc.accession}" target="_blank" rel="noopener">${desc.accession}</a></td>
-                <td class="blast-desc">${escHtml2(desc.title || '')}</td>
-                <td>${hsp.bit_score.toFixed(1)}</td>
-                <td>${hsp.evalue.toExponential(1)}</td>
-                <td>${identity}%</td>
-                <td>${hsp.align_len}</td>
-            </tr>`;
-        });
-        html += '</tbody></table>';
-
-        // Alignment detail area
-        html += '<div id="blastAlignmentDetail" class="panel" style="margin-top:12px;display:none"></div>';
-
-        container.innerHTML = html;
-        window._blastHits = hits;
-        blastSetStatus(`Found ${hits.length} hits.`, 'success');
-    } catch (e) {
-        container.innerHTML = `<pre style="color:var(--text-muted);padding:16px;white-space:pre-wrap">${escHtml2(JSON.stringify(data, null, 2).substring(0, 5000))}</pre>`;
-        blastSetStatus('Results displayed (raw format).', 'success');
+    // Parse EBI BLAST XML results
+    const hits = doc.querySelectorAll('hit');
+    if (!hits || hits.length === 0) {
+        container.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:40px">No significant similarity found.</div>';
+        blastSetStatus('Search complete — no significant hits.', 'warning');
+        return;
     }
+
+    window._blastHitsXml = [];
+
+    let html = `<table class="blast-table">
+        <thead><tr>
+            <th>#</th><th>Accession</th><th>Description</th>
+            <th>Score</th><th>E-value</th><th>Identity</th><th>Length</th>
+        </tr></thead><tbody>`;
+
+    hits.forEach((hit, idx) => {
+        const acc = hit.getAttribute('ac') || hit.querySelector('ac')?.textContent || '?';
+        const desc = hit.getAttribute('description') || hit.querySelector('description')?.textContent || '';
+        const hsp = hit.querySelector('hsp');
+        const score = hsp?.querySelector('score')?.textContent || '0';
+        const bits = hsp?.querySelector('bits')?.textContent || score;
+        const evalue = hsp?.querySelector('expectation')?.textContent || '?';
+        const identity = hsp?.querySelector('identity')?.textContent || '?';
+        const alignLen = hsp?.querySelector('alignlen')?.textContent || '?';
+        const querySeq = hsp?.querySelector('querySeq')?.textContent || '';
+        const matchSeq = hsp?.querySelector('matchSeq')?.textContent || '';
+        const pattern = hsp?.querySelector('pattern')?.textContent || '';
+
+        const identPct = (alignLen !== '?' && identity !== '?') ?
+            ((parseFloat(identity) / parseFloat(alignLen)) * 100).toFixed(1) : '?';
+
+        window._blastHitsXml.push({ acc, desc, score, bits, evalue, identity, alignLen, querySeq, matchSeq, pattern, identPct });
+
+        html += `<tr class="blast-row" onclick="blastShowAlignmentXml(${idx})">
+            <td>${idx + 1}</td>
+            <td><a href="https://www.uniprot.org/uniprot/${acc}" target="_blank" rel="noopener">${escHtml2(acc)}</a></td>
+            <td class="blast-desc">${escHtml2(desc.substring(0, 120))}</td>
+            <td>${parseFloat(bits).toFixed(1)}</td>
+            <td>${parseFloat(evalue).toExponential(1)}</td>
+            <td>${identPct}%</td>
+            <td>${alignLen}</td>
+        </tr>`;
+    });
+    html += '</tbody></table>';
+    html += '<div id="blastAlignmentDetail" class="panel" style="margin-top:12px;display:none"></div>';
+
+    container.innerHTML = html;
+    blastSetStatus(`Found ${hits.length} hits.`, 'success');
 }
 
-function blastRenderXML(xmlText) {
-    const container = document.getElementById('blastResults');
-    container.innerHTML = `<pre style="color:var(--text-muted);padding:16px;white-space:pre-wrap;max-height:600px;overflow:auto">${escHtml2(xmlText.substring(0, 10000))}</pre>`;
-    blastSetStatus('Results displayed (XML format).', 'success');
-}
-
-function blastShowAlignment(idx) {
-    const hit = window._blastHits[idx];
+function blastShowAlignmentXml(idx) {
+    const hit = window._blastHitsXml[idx];
     if (!hit) return;
-    const hsp = hit.hsps[0];
     const detail = document.getElementById('blastAlignmentDetail');
     if (!detail) return;
 
-    const identity = ((hsp.identity / hsp.align_len) * 100).toFixed(1);
-    const gaps = hsp.gaps || 0;
-
-    // Build the alignment display with midline
     let alignHtml = '';
-    const qseq = hsp.qseq;
-    const hseq = hsp.hseq;
-    const midline = hsp.midline || '';
+    const qseq = hit.querySeq;
+    const hseq = hit.matchSeq;
+    const midline = hit.pattern;
     const lineLen = 60;
 
     for (let i = 0; i < qseq.length; i += lineLen) {
@@ -2320,10 +2294,10 @@ function blastShowAlignment(idx) {
 
     detail.style.display = 'block';
     detail.innerHTML = `
-        <div style="font-weight:700;margin-bottom:8px">${escHtml2(hit.description[0].title || hit.description[0].accession)}</div>
+        <div style="font-weight:700;margin-bottom:8px">${escHtml2(hit.acc)} — ${escHtml2(hit.desc)}</div>
         <div style="color:var(--text-muted);font-size:13px;margin-bottom:8px">
-            Score: ${hsp.bit_score.toFixed(1)} bits | E-value: ${hsp.evalue.toExponential(2)} |
-            Identity: ${hsp.identity}/${hsp.align_len} (${identity}%) | Gaps: ${gaps}
+            Score: ${parseFloat(hit.bits).toFixed(1)} bits | E-value: ${parseFloat(hit.evalue).toExponential(2)} |
+            Identity: ${hit.identity}/${hit.alignLen} (${hit.identPct}%)
         </div>
         <pre style="font-family:Consolas,monospace;font-size:12px;overflow-x:auto;line-height:1.4">${alignHtml}</pre>`;
     detail.scrollIntoView({ behavior: 'smooth' });
