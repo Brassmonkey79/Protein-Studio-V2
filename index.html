@@ -2210,7 +2210,11 @@ async function blastFetchResults(jobId) {
     try {
         // Fetch XML results (EBI returns XML by default for ncbiblast)
         const res = await fetch(`${EBI_BLAST_BASE}/result/${jobId}/xml`);
-        const xmlText = await res.text();
+        let xmlText = await res.text();
+        // Strip XML namespace so querySelector works reliably across browsers
+        xmlText = xmlText.replace(/\s+xmlns="[^"]*"/g, '');
+        xmlText = xmlText.replace(/\s+xmlns:xsi="[^"]*"/g, '');
+        xmlText = xmlText.replace(/\s+xsi:noNamespaceSchemaLocation="[^"]*"/g, '');
         blastParseXML(xmlText);
     } catch (e) {
         blastSetStatus(`Error fetching results: ${e.message}`, 'error');
@@ -2222,14 +2226,17 @@ function blastParseXML(xmlText) {
     const parser = new DOMParser();
     const doc = parser.parseFromString(xmlText, 'text/xml');
 
-    // Helper: get element text by local name (ignoring namespace)
-    function getTag(parent, tagName) {
-        const els = parent.getElementsByTagNameNS('*', tagName);
-        return els.length > 0 ? els[0].textContent : null;
+    // Check for parse errors
+    const parseError = doc.querySelector('parsererror');
+    if (parseError) {
+        console.error('XML parse error:', parseError.textContent);
+        container.innerHTML = '<div style="color:var(--text-muted);padding:16px">Error parsing results. Raw data logged to console.</div>';
+        blastSetStatus('XML parse error.', 'error');
+        return;
     }
 
-    // Parse EBI BLAST XML results — hits are inside <SequenceSimilaritySearchResult><hits>
-    const hits = doc.getElementsByTagNameNS('*', 'hit');
+    // Find all hit elements
+    const hits = doc.querySelectorAll('hit');
     if (!hits || hits.length === 0) {
         container.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:40px">No significant similarity found.</div>';
         blastSetStatus('Search complete — no significant hits.', 'warning');
@@ -2250,15 +2257,17 @@ function blastParseXML(xmlText) {
         const desc = hit.getAttribute('description') || '';
         const hitLen = hit.getAttribute('length') || '?';
 
-        // First <alignment> child contains the scores
-        const aln = hit.getElementsByTagNameNS('*', 'alignment')[0];
-        const score = aln ? (getTag(aln, 'score') || '0') : '0';
-        const bits = aln ? (getTag(aln, 'bits') || score) : score;
-        const evalue = aln ? (getTag(aln, 'expectation') || '?') : '?';
-        const identity = aln ? (getTag(aln, 'identity') || '?') : '?'; // already a percentage
-        const querySeq = aln ? (getTag(aln, 'querySeq') || '') : '';
-        const matchSeq = aln ? (getTag(aln, 'matchSeq') || '') : '';
-        const pattern = aln ? (getTag(aln, 'pattern') || '') : '';
+        // Find first <alignment> (not <alignments>)
+        const aln = hit.querySelector('alignment');
+
+        // Extract values with safe fallbacks
+        const score = aln ? (aln.querySelector('score')?.textContent || '0') : '0';
+        const bits = aln ? (aln.querySelector('bits')?.textContent || score) : score;
+        const evalue = aln ? (aln.querySelector('expectation')?.textContent || '?') : '?';
+        const identity = aln ? (aln.querySelector('identity')?.textContent || '?') : '?';
+        const querySeq = aln ? (aln.querySelector('querySeq')?.textContent || '') : '';
+        const matchSeq = aln ? (aln.querySelector('matchSeq')?.textContent || '') : '';
+        const pattern = aln ? (aln.querySelector('pattern')?.textContent || '') : '';
 
         window._blastHitsXml.push({ acc, desc, score, bits, evalue, identity, hitLen, querySeq, matchSeq, pattern });
 
